@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP Switch",
+    "description": "Turn MCP servers on and off on demand. Everything starts disconnected so tool schemas cost no context; control it from the mcp_switch_* agent tools or the small panel under Settings."
+  }
+}

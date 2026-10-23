@@ -1,0 +1,39 @@
+{
+  "name": "dsh-plugin-mcp-switch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP 开关：agent 工具 mcp_switch_list / mcp_switch_on / mcp_switch_off，外加设置页里一个不起眼的 MCP 开关面板。MCP 默认断开，不占 token。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "license": "MIT"
+}

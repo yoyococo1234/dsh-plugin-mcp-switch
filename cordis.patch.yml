@@ -1,0 +1,6 @@
+# dsh-plugin-mcp-switch: one host row + one client bundle.
+# The host row owns MCP server state, the agent tools and a small REST API;
+# the client half adds the "MCP 开关" page under Settings.
+- insert:
+    - id: mcp-switch
+      name: 'dsh-plugin-mcp-switch'

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP 开关",
+    "description": "按需开关 MCP 服务器：默认全部断开，不占用上下文；agent 可用 mcp_switch_* 工具控制，设置页里也有一个开关面板。"
+  }
+}
