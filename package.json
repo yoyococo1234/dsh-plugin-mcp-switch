@@ -1,9 +1,27 @@
 {
   "name": "dsh-plugin-mcp-switch",
-  "version": "0.1.0",
-  "private": true,
-  "description": "MCP 开关：agent 工具 mcp_switch_list / mcp_switch_on / mcp_switch_off，外加设置页里一个不起眼的 MCP 开关面板。MCP 默认断开，不占 token。",
+  "version": "1.0.0",
+  "description": "Per-session MCP switch for DeepSeek Harness: MCP servers start disconnected; the agent opens one inside a chat and only that chat sees the tools. Settings panel, group presets and 24 tests.",
   "type": "module",
+  "license": "MIT",
+  "author": "yoyococo1234 <yoyococo1234@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yoyococo1234/dsh-plugin-mcp-switch.git"
+  },
+  "homepage": "https://github.com/yoyococo1234/dsh-plugin-mcp-switch#readme",
+  "bugs": {
+    "url": "https://github.com/yoyococo1234/dsh-plugin-mcp-switch/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "mcp",
+    "mcp-switch",
+    "session-isolation",
+    "settings"
+  ],
   "main": "index.js",
   "exports": {
     ".": "./index.js",
@@ -20,13 +38,15 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "check": "node --check index.js && node --check host-bridge.mjs && node --check client.js && npm test"
   },
   "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0",
     "node": ">=22"
   },
   "dsh": {
@@ -40,6 +60,5 @@
         "@deepseek-ai/dsh-client-ui-settings"
       ]
     }
-  },
-  "license": "MIT"
+  }
 }
