@@ -14,12 +14,18 @@
   },
   "files": [
     "index.js",
+    "host-bridge.mjs",
+    "lib/*.mjs",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
     "README.md"
   ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check index.js && node --check host-bridge.mjs && node --check client.js && npm test"
+  },
   "engines": {
     "node": ">=22"
   },

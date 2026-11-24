@@ -20,15 +20,30 @@
  *   auto-start  — 只自动连 autoStart:true 的
  *
  * 关键实现点（踩过的坑）：@deepseek-ai/dsh-mcp-client 打在 dsh 安装目录的
- * app.asar 里，profile 安装的插件用裸包名 import 在开机加载时会失败，所以这里
- * 用 process.resourcesPath + pathToFileURL 按绝对路径动态导入（Electron 认 asar）。
+ * app.asar 里，profile 安装的插件用裸包名 import 在开机加载时会失败，所以必须按
+ * 绝对路径动态导入（Electron 认 asar）。
+ *
+ * 2026-10-30 加固：不再把「安装路径 + lib/index.js」写死，改由 ./host-bridge.mjs
+ * 逐候选真 import 解析（裸说明符 → DSH_APP_MODULES → 各候选根目录 × 各候选入口，
+ * 入口按包自己的 exports/main 决定），并做形状校验；全部失败时**不抛异常**，
+ * 插件照常加载，只在连 MCP 时明确报「MCP 桥不可用」+ 尝试清单。
  */
 
 import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, renameSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
-import { pathToFileURL } from 'node:url'
+import { resolveHostMcpClient } from './host-bridge.mjs'
+import {
+  addOwner,
+  removeOwner,
+  isVisibleTo as isServerVisibleTo,
+  dropSessionOwners,
+  ownersToObject,
+  objectToOwners,
+  visibleToText,
+} from './lib/session-owners.mjs'
+import { ToolNameCache, buildMaskPlan, DirtyScheduler } from './lib/mask-planner.mjs'
 
 export const name = 'mcp-switch'
 export const inject = ['tools']
@@ -51,13 +66,19 @@ const SEED_COSTS = {
   cad: { tools: 2, bytes: 966, tokens: 268 },
 }
 
-const HOST_DSH_NODE_MODULES = process.resourcesPath
-  ? join(process.resourcesPath, 'app.asar', 'dsh', 'node_modules')
-  : join(homedir(), 'AppData', 'Local', 'Programs', 'DeepSeek Harness', 'resources', 'app.asar', 'dsh', 'node_modules')
-
-const mcpClient = await import(
-  pathToFileURL(join(HOST_DSH_NODE_MODULES, '@deepseek-ai', 'dsh-mcp-client', 'lib', 'index.js')).href
-)
+/**
+ * 宿主 MCP 桥的解析结果（见 host-bridge.mjs）。
+ * `bridge.ok === false` 时插件仍会加载，只是连 MCP 会给出明确错误而不是整插件崩掉。
+ */
+const bridge = await resolveHostMcpClient()
+const mcpClient = bridge.module
+/** 供 /state 与日志复用的解析摘要。 */
+const bridgeInfo = () => ({
+  ok: bridge.ok,
+  source: bridge.source,
+  attempts: bridge.tried.length,
+  error: bridge.ok ? undefined : bridge.error,
+})
 
 // ── 状态 ────────────────────────────────────────────────────────────────────
 
@@ -68,7 +89,9 @@ function readJson(path) {
 /** 原子写 + 保留上一版备份：写临时文件再 rename，避免中途失败留下截断的 JSON。 */
 function saveState(state) {
   mkdirSync(dirname(STATE_PATH), { recursive: true })
-  const text = JSON.stringify(state, null, 2)
+  // Map 不能直接 JSON 化：落盘时把归属转成普通对象
+  const serializable = { ...state, owners: ownersToObject(state.owners) }
+  const text = JSON.stringify(serializable, null, 2)
   const tmp = STATE_PATH + '.tmp'
   writeFileSync(tmp, text)
   try {
@@ -101,6 +124,8 @@ function loadState() {
       reclaimOnSessionEnd: own.reclaimOnSessionEnd !== false,
       groups: own.groups && typeof own.groups === 'object' ? own.groups : {},
       servers: own.servers.map(normalizeServer),
+      // 会话归属落盘：重启后只能认当前活着的会话，stale id 在 apply() 里清理
+      owners: objectToOwners(own.owners),
     }
   }
   const legacy = readJson(LEGACY_STATE_PATH)
@@ -110,11 +135,12 @@ function loadState() {
       reclaimOnSessionEnd: true,
       groups: {},
       servers: legacy.servers.map((s) => normalizeServer({ ...s, enabled: false, autoStart: false })),
+      owners: new Map(),
     }
     saveState(migrated)
     return migrated
   }
-  return { startupMode: 'always-off', reclaimOnSessionEnd: true, groups: {}, servers: [] }
+  return { startupMode: 'always-off', reclaimOnSessionEnd: true, groups: {}, servers: [], owners: new Map() }
 }
 
 /** ${VAR} 模板在启动时解析为进程环境变量，token 不落盘。 */
@@ -139,8 +165,35 @@ export function apply(ctx) {
   const state = loadState()
   /** id -> { fiber, status, error, errorDetail } */
   const live = new Map()
-  /** id -> 打开它的会话 id（用于会话结束回收） */
-  const openedBy = new Map()
+  /**
+   * id -> Set<会话 id>：哪些会话「拥有」这个连接。
+   * 空集 = 匿名打开（设置页 / REST API / 启动策略），对所有会话可见；
+   * 非空 = 只有这些会话及其子智能体看得见（见下面的会话级可见性）。
+   * 指向 state.owners，随 saveState 一起落盘；启动时清掉已不存在的 stale 会话 id。
+   */
+  const openedBy = state.owners instanceof Map ? state.owners : (state.owners = new Map())
+  ;{
+    // 重启后旧 session id 都失效了：只保留当前活着的会话，否则会误挡新会话或留归属给幽灵。
+    // fail-safe：拿不到 agents 服务时**保留**归属（宁可让连接暂时只对旧 id 可见，
+    // 也不要误清成匿名、把昂贵工具放开给所有会话）。
+    let alive = null
+    try {
+      const svc = ctx.get('agents')
+      if (svc && typeof svc.list === 'function') {
+        alive = new Set((svc.list() || []).map((a) => String(a?.id || a)))
+      }
+    } catch { alive = null }
+    if (alive) {
+      let pruned = false
+      for (const [sid, set] of [...openedBy]) {
+        for (const owner of [...set]) {
+          if (!alive.has(owner)) { set.delete(owner); pruned = true }
+        }
+        if (!set.size) openedBy.delete(sid)
+      }
+      if (pruned) saveState(state)
+    }
+  }
   /** 同一服务器的启停串行化，避免 serverName 预约竞争 */
   const ops = new Map()
 
@@ -204,13 +257,21 @@ export function apply(ctx) {
     // 先同步占位成 connecting：API/工具读状态时不必等 enqueue 真正执行
     const prev = live.get(server.id)
     live.set(server.id, { fiber: prev?.fiber ?? null, status: 'connecting', error: '', errorDetail: '' })
-    if (sessionId) openedBy.set(server.id, sessionId)
+    if (sessionId && addOwner(openedBy, server.id, sessionId)) saveState(state)
     return enqueue(server.id, async () => {
       const existing = live.get(server.id)
       if (existing?.fiber) await disposeFiber(existing.fiber)
       const entry = { fiber: null, status: 'connecting', error: '', errorDetail: '' }
       live.set(server.id, entry)
       try {
+        if (!mcpClient) {
+          // 宿主桥没解析到：明确报出来，不要让 ctx.plugin(undefined) 抛一个看不懂的错
+          entry.status = 'error'
+          entry.error = 'MCP 桥不可用：未解析到宿主的 @deepseek-ai/dsh-mcp-client'
+          entry.errorDetail = bridge.error || ''
+          ctx.logger?.warn?.(`[mcp-switch] ${entry.error}\n${entry.errorDetail}`)
+          return
+        }
         const fiber = ctx.plugin(mcpClient, serverConfig(server))
         entry.fiber = fiber
         await fiber
@@ -225,6 +286,12 @@ export function apply(ctx) {
           server.cost = cost
           saveState(state)
         }
+        // MCP 工具是握手之后才异步注册的：先等工具名出现，再给「不拥有它的会话」套遮挡。
+        // 拿空清单去挡等于什么都没挡（2026-11-04 实测踩到）。
+        for (let i = 0; i < 20 && !serverToolNames(server).length; i += 1) {
+          await new Promise((r) => setTimeout(r, 150))
+        }
+        syncAllAgents()
       } catch (e) {
         entry.status = 'error'
         entry.error = e?.message || String(e)
@@ -241,6 +308,8 @@ export function apply(ctx) {
   function stopServer(id) {
     return enqueue(id, async () => {
       openedBy.delete(id)
+      cache.delete(id)
+      dropMasksForServer(id)
       const entry = live.get(id)
       if (!entry) return
       live.delete(id)
@@ -253,9 +322,195 @@ export function apply(ctx) {
     return state.servers.find((s) => s.name === nameOrId) || state.servers.find((s) => s.id === nameOrId)
   }
 
+  // ── 会话级可见性（2026-11-03）────────────────────────────────────────────
+  // MCP 客户端挂在宿主全局 ctx 上，工具注册进全局表，进程里每个会话都看得见。
+  // 这里给「不拥有该连接的会话」加一层 tools.restrict({ deny: [mcp__<name>__*] })：
+  // 从该会话的可见集合里摘掉，模型看不到 = 不付 token，误调也会判 UNKNOWN_TOOL。
+  //
+  // 拿「该会话作用域下的 tools 服务」按优先级尝试，任一步失败就退回全局（不隔离）
+  // 并把原因记在状态里，绝不冒险把遮挡打到全局层。
+
+  /** agentId -> { tools, agent }：该会话作用域下的 tools 服务 */
+  const scopedTools = new Map()
+  /** agentId -> Map(serverId -> restrict 的 disposer) */
+  const masks = new Map()
+  /** serverId -> 工具名快照：集合不变就不重打遮挡 */
+  const cache = new ToolNameCache()
+  /** 'ok' | 'unsupported' | 'unknown' */
+  let scopingState = 'unknown'
+  let scopingReason = ''
+  const warnedOnce = new Set()
+
+  function warnOnce(key, message) {
+    if (warnedOnce.has(key)) return
+    warnedOnce.add(key)
+    ctx.logger?.warn?.(`[mcp-switch] ${message}`)
+  }
+
+  function scopedToolsFor(agent) {
+    const id = String(agent?.id || '')
+    if (!id) return null
+    const cached = scopedTools.get(id)
+    if (cached) return cached
+    let tools = null
+    // Agent 的 ctx 就是它自己的作用域上下文（agent-loop 里 this.ctx = createScope(loopCtx, agent).ctx），
+    // 用它调 tools.restrict 只会影响这一个会话；调用方若是全局 ctx，宿主会直接抛错而不是误伤所有人。
+    try { tools = agent?.ctx?.tools || null } catch { tools = null }
+    if (!tools?.restrict) {
+      try { tools = ctx.get('agentPresets')?.serviceFor?.(agent, 'tools') || null } catch { tools = null }
+    }
+    if (!tools?.restrict) {
+      if (scopingState !== 'ok') {
+        scopingState = 'unsupported'
+        scopingReason = '拿不到该会话作用域下的 tools 服务'
+      }
+      return null
+    }
+    const rec = { tools, agent }
+    scopedTools.set(id, rec)
+    return rec
+  }
+
+  /** 该服务器当前注册的工具名（全局视角）。结果进 ToolNameCache，集合不变就不重打 restrict。 */
+  function serverToolNames(server) {
+    const prefix = `mcp__${server.name}__`
+    let names = []
+    try {
+      names = (ctx.tools.schemas?.() || []).map((s) => String(s.name)).filter((n) => n.startsWith(prefix))
+    } catch { /* 工具表暂时不可用，交给缓存的上一版 */ }
+    return cache.update(server.id, names).names
+  }
+
+  /** 这个会话能不能看见该连接：拥有者本人、或拥有者的子智能体；匿名打开则人人可见。 */
+  function ownsServer(serverId, agent) {
+    const agents = ctx.get('agents')
+    const isOwnedBy = (child, owner) => {
+      const ownerAgent = agents?.get?.(owner)
+      return ownerAgent ? !!agents?.isOwnedBy?.(child, ownerAgent) : false
+    }
+    return isServerVisibleTo(openedBy, serverId, agent?.id, isOwnedBy)
+  }
+
+  /** 让一个会话的可见性对齐该服务器的当前归属。返回是否处于「被遮挡」状态。 */
+  function syncMask(agent, server) {
+    const id = String(agent?.id || '')
+    if (!id) return false
+    const connected = live.get(server.id)?.status === 'connected'
+    const names = connected ? serverToolNames(server) : []
+    const shouldMask = connected && names.length > 0 && !ownsServer(server.id, agent)
+
+    let per = masks.get(id)
+    const existing = per?.get(server.id)
+    if (!shouldMask) {
+      if (existing) {
+        try { existing.dispose() } catch { /* ignore */ }
+        per.delete(server.id)
+        if (!per.size) masks.delete(id)
+      }
+      return false
+    }
+    // MCP 工具是异步注册的，清单会变长：名字集合变了就得重打一次遮挡。
+    // 用规范化 key（排序+去重），集合没变就不重打，避免 restrict 抖动。
+    const key = ToolNameCache.keyOf(names)
+    if (existing && existing.key === key) return true
+    if (existing) {
+      try { existing.dispose() } catch { /* ignore */ }
+      per.delete(server.id)
+    }
+
+    const rec = scopedToolsFor(agent)
+    if (!rec) return false
+    try {
+      const dispose = rec.tools.restrict({ deny: names })
+      if (!per) { per = new Map(); masks.set(id, per) }
+      per.set(server.id, { dispose, key })
+      // 自检：该会话看不见了、全局还看得见，才算遮挡成功
+      const agentView = new Set((ctx.tools.schemas?.(agent) || []).map((s) => String(s.name)))
+      const globalView = new Set((ctx.tools.schemas?.() || []).map((s) => String(s.name)))
+      const leaked = names.filter((n) => agentView.has(n))
+      const overreach = names.filter((n) => !globalView.has(n))
+      if (leaked.length || overreach.length) {
+        try { dispose() } catch { /* ignore */ }
+        per.delete(server.id)
+        if (!per.size) masks.delete(id)
+        scopingState = 'unsupported'
+        scopingReason = leaked.length ? 'restrict 没作用到该会话作用域' : 'restrict 影响到了全局'
+        warnOnce('restrict-mismatch', `会话隔离不可用（${scopingReason}），已退回全局可见`)
+        return false
+      }
+      scopingState = 'ok'
+      scopingReason = ''
+      return true
+    } catch (e) {
+      warnOnce('restrict-failed', `会话隔离失败：${e?.message || e}`)
+      return false
+    }
+  }
+
+  /** 把所有活着的会话对齐一遍（连上/断开/新会话/工具表变化时调用）。 */
+  function syncAllAgents() {
+    const agents = ctx.get('agents')
+    let list = []
+    try { list = agents?.list?.() || [] } catch { list = [] }
+    for (const agent of list) {
+      for (const server of state.servers) {
+        try { syncMask(agent, server) } catch (e) {
+          warnOnce('sync-failed', `对齐会话可见性失败：${e?.message || e}`)
+        }
+      }
+    }
+  }
+
+  /**
+   * 脏标记调度：syncing 期间再来的 tools/change 不再被吞掉，而是标记脏并重跑，
+   * 直到一轮没有新变更（或到 maxRounds 上限，防 restrict 自激循环）。
+   */
+  const syncScheduler = new DirtyScheduler(() => syncAllAgents())
+
+  /** 工具表一变（MCP 刚注册完工具、或我们自己刚加了遮挡）就重算一次，防抖后进脏标记循环。 */
+  let syncTimer = null
+  function scheduleSync() {
+    if (syncTimer) return
+    syncTimer = setTimeout(() => {
+      syncTimer = null
+      const wasTruncated = syncScheduler.truncated
+      syncScheduler.request()
+      if (syncScheduler.truncated && !wasTruncated) {
+        warnOnce('sync-loop', '会话可见性对齐连续触发，已在本轮截断（restrict 可能自激 tools/change）')
+      }
+    }, 80)
+  }
+
+  function dropMasksForServer(serverId) {
+    for (const [id, per] of [...masks.entries()]) {
+      const entry = per.get(serverId)
+      if (!entry) continue
+      try { entry.dispose() } catch { /* ignore */ }
+      per.delete(serverId)
+      if (!per.size) masks.delete(id)
+    }
+  }
+
+  function dropMasksForAgent(agentId) {
+    const id = String(agentId || '')
+    const per = masks.get(id)
+    if (per) {
+      for (const entry of per.values()) { try { entry.dispose() } catch { /* ignore */ } }
+      masks.delete(id)
+    }
+    scopedTools.delete(id)
+  }
+
+  /** 会话 id 缩成 8 位（去掉 session- 前缀），够分辨又不刷屏。 */
+  function shortSession(id) {
+    const s = String(id || '').replace(/^session[-_]/i, '')
+    return s.length > 8 ? s.slice(0, 8) : s
+  }
+
   function publicStatus() {
     return state.servers.map((s) => {
       const l = live.get(s.id)
+      const owners = openedBy.get(s.id) || new Set()
       return {
         id: s.id,
         name: s.name,
@@ -266,7 +521,9 @@ export function apply(ctx) {
         error: l?.error || '',
         errorDetail: l?.errorDetail || '',
         cost: s.cost || null,
-        openedBy: openedBy.get(s.id) || '',
+        openedBy: [...owners].join(','),
+        /** 人看的归属：空集 = 全局；否则列出拥有者会话 */
+        visibleTo: visibleToText(openedBy, s.id, shortSession),
       }
     })
   }
@@ -338,19 +595,30 @@ export function apply(ctx) {
 
     const connected = []
     const disconnected = []
+    const hidden = []
     for (const s of state.servers) {
       if (members.includes(s.name)) {
         if (s.enabled !== true) setEnabled(s, true, sessionId)
+        else if (sessionId && addOwner(openedBy, s.id, sessionId)) saveState(state)
         connected.push(s.name)
       } else if (s.enabled !== false) {
-        setEnabled(s, false)
-        disconnected.push(s.name)
+        // 组外：对称处理——只摘当前会话归属，别人还在用就保留连接
+        const r = removeOwner(openedBy, s.id, sessionId)
+        if (r.anonymous || r.empty) {
+          setEnabled(s, false)
+          disconnected.push(s.name)
+        } else if (r.removed) {
+          hidden.push(s.name)
+        }
       }
     }
     for (const name of connected) await waitSettled(findServer(name)?.id)
+    if (hidden.length) syncAllAgents()
     return {
       ok: true,
-      message: `已应用分组 "${groupName}"：连接 ${connected.join('、') || '无'}${disconnected.length ? `；断开 ${disconnected.join('、')}` : ''}`,
+      message: `已应用分组 "${groupName}"：连接 ${connected.join('、') || '无'}` +
+        `${disconnected.length ? `；断开 ${disconnected.join('、')}` : ''}` +
+        `${hidden.length ? `；对你关闭 ${hidden.join('、')}（其他会话仍在用）` : ''}`,
     }
   }
 
@@ -367,21 +635,38 @@ export function apply(ctx) {
     saveState(state)
   }
 
-  // ── 会话结束回收（#8）────────────────────────────────────────────────────
-  // 记录是哪个会话把服务器打开的；该会话的 agent 被 dispose 时回收。
+  // ── 会话结束回收（#8）与可见性收尾 ───────────────────────────────────────
+  // 记录是哪些会话把服务器打开的；拥有者全部走了才回收。
   const offDisposed = ctx.on('agent/disposed', (payload) => {
-    if (state.reclaimOnSessionEnd === false) return
-    const sessionId = payload?.agent?.id
+    const sessionId = payload?.agent?.id ? String(payload.agent.id) : ''
     if (!sessionId) return
-    for (const [id, owner] of [...openedBy.entries()]) {
-      if (owner !== sessionId) continue
+    dropMasksForAgent(sessionId)
+    const { changed, emptied } = dropSessionOwners(openedBy, sessionId, state.reclaimOnSessionEnd !== false)
+    for (const id of emptied) {
       const server = state.servers.find((s) => s.id === id)
       if (!server) continue
       server.enabled = false
       stopServer(id)
       ctx.logger?.info?.(`[mcp-switch] 会话结束回收 "${server.name}"`)
     }
-    saveState(state)
+    if (changed) {
+      saveState(state)
+      syncAllAgents() // 归属变了：其他人的遮挡要跟着重算
+    }
+  })
+
+  // 新会话进来：立刻对齐到当前归属（不拥有某个连接就给它套上遮挡）
+  const offCreated = ctx.on('agent/created', (payload) => {
+    const agent = payload?.agent
+    if (!agent) return
+    for (const server of state.servers) {
+      try { syncMask(agent, server) } catch { /* 单个会话失败不影响别的 */ }
+    }
+  })
+
+  // 工具表变化（MCP 陆续注册完工具、或我们刚加了遮挡）→ 脏标记循环里重算
+  const offToolsChange = ctx.on('tools/change', () => {
+    scheduleSync()
   })
 
   // ── agent 工具 ───────────────────────────────────────────────────────────
@@ -398,12 +683,14 @@ export function apply(ctx) {
       error: { type: 'string' },
       detail: { type: 'string' },
       costText: { type: 'string' },
+      visibleTo: { type: 'string' },
     },
   }
 
   const statusValue = () => ({
     startupMode: normalizeMode(state.startupMode),
     reclaimOnSessionEnd: state.reclaimOnSessionEnd !== false,
+    scoping: { state: scopingState, reason: scopingReason, masked: [...masks.keys()].map(shortSession) },
     groups: Object.keys(state.groups),
     servers: publicStatus().map((s) => ({
       name: s.name,
@@ -414,6 +701,7 @@ export function apply(ctx) {
       error: s.error,
       detail: s.errorDetail && s.errorDetail !== s.error ? s.errorDetail : '',
       costText: s.cost ? `${s.cost.tools} 工具 / 约 ${fmtTokens(s.cost.tokens)}` : '未测',
+      visibleTo: s.visibleTo,
     })),
   })
 
@@ -430,6 +718,15 @@ export function apply(ctx) {
         properties: {
           startupMode: { type: 'string' },
           reclaimOnSessionEnd: { type: 'boolean' },
+          scoping: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              state: { type: 'string' },
+              reason: { type: 'string' },
+              masked: { type: 'array', items: { type: 'string' } },
+            },
+          },
           groups: { type: 'array', items: { type: 'string' } },
           servers: { type: 'array', items: serversSchema },
         },
@@ -443,6 +740,10 @@ export function apply(ctx) {
         const head = [
           `启动策略：${modeText}`,
           `会话结束回收：${value.reclaimOnSessionEnd ? '开' : '关'}`,
+          value.scoping?.state === 'ok'
+            ? `会话隔离：开（只有打开的会话看得见${value.scoping.masked?.length ? `；已遮挡 ${value.scoping.masked.join('、')}` : '；当前没有别的会话'}）`
+            : value.scoping?.state === 'unsupported' ? `会话隔离：不可用（${value.scoping.reason || '未知原因'}）`
+              : '会话隔离：未验证',
           value.groups.length ? `分组：${value.groups.join('、')}` : '',
         ].filter(Boolean)
         if (!value.servers.length) return [{ type: 'text', text: [...head, '还没有配置任何 MCP 服务器。'].join('\n') }]
@@ -450,6 +751,7 @@ export function apply(ctx) {
           const flags = [
             s.autoStart ? '自启' : '',
             s.costText,
+            s.status === 'connected' ? `可见：${s.visibleTo || '全部会话'}` : '',
             s.error ? `错误：${s.error}` : '',
             s.detail ? `详情：${String(s.detail).slice(0, 160)}` : '',
           ].filter(Boolean).join('；')
@@ -507,13 +809,30 @@ export function apply(ctx) {
       }
 
       const started = []
+      const already = []
       for (const s of targets) {
         const cur = publicStatus().find((x) => x.id === s.id)
-        if (cur?.status === 'connected') continue
+        if (cur?.status === 'connected') {
+          // 已经连着也要登记归属：别的会话已经打开了，这个会话申请就也该看得见
+          if (sessionId && addOwner(openedBy, s.id, sessionId)) {
+            saveState(state)
+            already.push(s)
+          }
+          continue
+        }
         setEnabled(s, true, sessionId)
         started.push(s)
       }
-      if (!started.length) return { name: targets.map((s) => s.name).join('、'), status: 'connected', message: '本来就都连着，没动。' }
+      if (already.length) syncAllAgents()
+      if (!started.length) {
+        return {
+          name: targets.map((s) => s.name).join('、'),
+          status: 'connected',
+          message: already.length
+            ? `本来就连着，已把这个会话加进可见范围（${already.map((s) => s.name).join('、')}）。`
+            : '本来就都连着，没动。',
+        }
+      }
 
       const results = []
       for (const s of started) {
@@ -534,7 +853,9 @@ export function apply(ctx) {
 
   const offTool = {
     name: 'mcp_switch_off',
-    description: '关闭（断开）一个 MCP 服务器，卸载它的 mcp__<名称>__* 工具，释放上下文。name 传 "all" 表示全部断开。',
+    description:
+      '关闭一个 MCP。AI 在对话里调用时只对自己关闭（摘除本会话归属），别的进行中的对话不受影响；' +
+      '只有最后一个拥有者关闭时才真正断开、释放上下文。面板/自启打开的匿名连接会全局断开。name 传 "all" 表示全部。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -547,13 +868,39 @@ export function apply(ctx) {
     },
     timeoutMs: 120000,
     isConcurrencySafe: () => false,
-    execute: async (args) => {
+    execute: async (args, exec) => {
+      const sessionId = exec?.agent?.id ? String(exec.agent.id) : ''
       const targets = args.name === 'all' ? state.servers : [findServer(args.name)].filter(Boolean)
       if (!targets.length) return { name: String(args.name || ''), status: 'error', message: '找不到这个 MCP 服务器' }
-      for (const s of targets) setEnabled(s, false)
+      const fullyClosed = []
+      const leftOpen = []
+      for (const s of targets) {
+        // 有归属会话：只摘当前会话，其他拥有者继续用；最后一个走了才真断。
+        // 匿名连接（面板/REST/自启打开）没有 owner，谁 off 都是全局断开。
+        const r = removeOwner(openedBy, s.id, sessionId)
+        if (r.anonymous || r.empty) {
+          stopServer(s.id)
+          s.enabled = false
+          fullyClosed.push(s.name)
+        } else if (r.removed) {
+          leftOpen.push(s.name)
+        } else {
+          // 当前会话本来就不是 owner：不动别人的连接，只摘掉可能给这个会话的遮挡
+          dropMasksForAgent(sessionId)
+        }
+      }
+      saveState(state)
+      syncAllAgents()
       await new Promise((r) => setTimeout(r, 300))
       const names = targets.map((s) => s.name).join('、')
-      return { name: names, status: 'disabled', message: `已断开 ${names}。` }
+      const bits = []
+      if (fullyClosed.length) bits.push(`已断开 ${fullyClosed.join('、')}`)
+      if (leftOpen.length) bits.push(`${leftOpen.join('、')} 已对你关闭（其他会话仍在用）`)
+      return {
+        name: names,
+        status: fullyClosed.length ? 'disabled' : 'hidden',
+        message: bits.join('；') || `已对当前会话隐藏 ${names}。`,
+      }
     },
   }
 
@@ -855,6 +1202,8 @@ export function apply(ctx) {
               reclaimOnSessionEnd: state.reclaimOnSessionEnd !== false,
               groups: Object.entries(state.groups).map(([name, servers]) => ({ name, servers: [...servers] })),
               servers: publicStatus(),
+              scoping: { state: scopingState, reason: scopingReason, masked: [...masks.keys()].map(shortSession) },
+              bridge: bridgeInfo(),
             })
           }
           if (m === 'GET' && p === `${API_PREFIX}/servers`) {
@@ -889,11 +1238,12 @@ export function apply(ctx) {
           if (m === 'POST' && mm) {
             const server = findServer(mm[1])
             if (!server) return sendJson(res, 404, { ok: false, error: '服务器不存在' })
-            if (mm[2] === 'connect' && heavyGate(server, false)) {
+            const body = JSON.parse((await readBody(req)) || '{}')
+            if (mm[2] === 'connect' && heavyGate(server, body.confirm === true)) {
               return sendJson(res, 409, {
                 ok: false,
                 needsConfirm: true,
-                error: `${server.name} 约 ${fmtTokens(server.cost?.tokens)}，请在面板确认或改用 agent 工具带 confirm:true`,
+                error: `${server.name} 约 ${fmtTokens(server.cost?.tokens)}，再点一次「确认连接」以打开`,
               })
             }
             return sendJson(res, 200, setEnabled(server, mm[2] === 'connect', ''))
@@ -908,6 +1258,10 @@ export function apply(ctx) {
 
   return async () => {
     try { offDisposed() } catch { /* ignore */ }
+    try { offCreated() } catch { /* ignore */ }
+    try { offToolsChange() } catch { /* ignore */ }
+    if (syncTimer) { clearTimeout(syncTimer); syncTimer = null }
+    for (const id of [...masks.keys()]) dropMasksForAgent(id)
     await Promise.all([...live.keys()].map((id) => stopServer(id)))
     try { webFiber.dispose() } catch { /* ignore */ }
   }
